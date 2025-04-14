@@ -6,13 +6,6 @@ from typing import Dict, Optional, Union
 import torch
 import torch.nn as nn
 
-try:
-    from bitsandbytes.triton.int8_matmul_mixed_dequantize import int8_matmul_mixed_dequantize
-    from bitsandbytes.triton.quantize_rowwise import quantize_rowwise
-    from bitsandbytes.triton.triton_utils import is_triton_available
-except ModuleNotFoundError:
-    print("bitsandbytes is not installed. SwitchBack cannot be used.")
-
 from replay.data.nn import TensorFeatureInfo, TensorMap, TensorSchema
 
 
@@ -107,11 +100,7 @@ class Bert4RecModel(torch.nn.Module):
             self._head = EmbeddingTyingHead(self.item_embedder, self.item_count)
         else:
             if acceleration_config:
-                if  acceleration_config.get("head"):
-                    if acceleration_config["head"] == "linear_head":
-                        self._head = LinearHead(hidden_size, self.item_count)
-                    elif acceleration_config["head"] == "swichback_head":
-                        self._head = SwichBackHead(hidden_size, self.item_count)
+                self._head = LinearHead(hidden_size, self.item_count)
             else:
                 self._head = ClassificationHead(hidden_size, self.item_count)
 
@@ -508,31 +497,6 @@ class ClassificationHead(BaseHead):
         """
         return self.linear.bias
 
-class LinearHead(torch.nn.Module):
-    """
-    Linear layer for classification
-    """
-
-    def __init__(self, hidden_size: int, n_items: int) -> None:
-        """
-        :param hidden_size: Hidden size of transformer.
-        :param n_items: Number of items.
-        """
-        super().__init__()
-        self.linear = torch.nn.Linear(hidden_size, n_items, bias=True)
-
-    def get_item_embeddings(self) -> torch.Tensor:
-        """
-        :returns: Item embeddings.
-        """
-        return self.linear.weight
-
-    def get_bias(self) -> torch.Tensor:
-        """
-        :returns: Bias tensor.
-        """
-        return self.linear.bias
-    
     def forward(
         self,
         out_embeddings: torch.Tensor,
@@ -545,92 +509,8 @@ class LinearHead(torch.nn.Module):
 
         :returns: Calculated logits.
         """
-         
-        logits = self.linear(out_embeddings)
+        logits = torch.nn.functional.linear(out_embeddings, self.linear.weight, self.linear.bias)
         return logits
-
-
-class _switchback_global(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, X_3D, W, bias):
-        X = X_3D.view(-1, X_3D.size(-1))
-        X_int8, state_X = quantize_rowwise(X)
-        W_int8, state_W = quantize_rowwise(W)
-        ctx.save_for_backward = X, W, bias
-        res = int8_matmul_mixed_dequantize(X_int8, W_int8.t(), state_X, state_W, bias).view(*X_3D.size()[:-1], -1)
-        return res
-
-    @staticmethod
-    def backward(ctx, grad_output_3D):
-        input, weight, bias = ctx.save_for_backward
-        grad_output = grad_output_3D.reshape(-1, grad_output_3D.size(-1))
-        grad_input = grad_weight = grad_bias = None
-        if ctx.needs_input_grad[0]:
-            grad_input = grad_output.matmul(weight.to(grad_output.dtype)).view(*grad_output_3D.size()[:-1], -1)
-        if ctx.needs_input_grad[1]:
-            grad_weight = grad_output.t().matmul(input.to(grad_output.dtype))
-        if bias is not None and ctx.needs_input_grad[2]:
-            grad_bias = grad_output.sum(0)
-        return grad_input, grad_weight, grad_bias
-       
-class SwitchBackLinear(nn.Linear):
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = True,
-        device=None,
-        dtype=None,
-    ):
-        super().__init__(in_features, out_features, bias, device, dtype)
-
-        if not is_triton_available():
-            raise ImportError("""Could not import triton. Please install triton to use SwitchBackLinear.
-                               Alternatively, you can use bnb.nn.SwitchBackLinearBnb, but it will be slower""")
-        self._fn = _switchback_global
-
-
-class SwichBackHead(BaseHead):
-
-    def __init__(self, hidden_size: int, n_items: int) -> None:
-        """
-        :param hidden_size: Hidden size of transformer.
-        :param n_items: Number of items.
-        """
-        super().__init__()
-        self.linear = SwitchBackLinear(hidden_size, n_items, bias=True)
-
-    def get_item_embeddings(self) -> torch.Tensor:
-        """
-        :returns: Item embeddings.
-        """
-        return self.linear.weight
-
-    def get_bias(self) -> torch.Tensor:
-        """
-        :returns: Bias tensor.
-        """
-        return self.linear.bias
-    
-    def forward(self, out_embeddings: torch.Tensor, item_ids: Optional[torch.LongTensor] = None) -> torch.Tensor:
-        """
-        Override the forward to use SwitchBackLinear's custom forward logic.
-
-        :param out_embeddings: Embeddings after `forward step`.
-        :param item_ids: Item ids to calculate scores.
-            Default: ``None``.
-
-        :returns: Calculated logits.
-        """
-        if item_ids is not None:
-            item_embeddings = self.linear.weight[item_ids]
-            bias = self.linear.bias[item_ids]
-        else:
-            item_embeddings = self.linear.weight
-            bias = self.linear.bias
-        logits = self.linear._fn.apply(out_embeddings, item_embeddings, bias)
-        return logits
-
 
 class TransformerBlock(torch.nn.Module):
     """
@@ -654,11 +534,11 @@ class TransformerBlock(torch.nn.Module):
         super().__init__()
         self.attention = torch.nn.MultiheadAttention(hidden_size, attn_heads, dropout=dropout, batch_first=True)
         self.attention_dropout = torch.nn.Dropout(dropout)
-        self.attention_norm = LayerNorm(hidden_size)
+        self.attention_norm = torch.nn.LayerNorm(hidden_size)
 
         self.pff = PositionwiseFeedForward(d_model=hidden_size, d_ff=feed_forward_hidden, dropout=dropout)
         self.pff_dropout = torch.nn.Dropout(dropout)
-        self.pff_norm = LayerNorm(hidden_size)
+        self.pff_norm = torch.nn.LayerNorm(hidden_size)
 
         self.dropout = torch.nn.Dropout(p=dropout)
 
@@ -707,7 +587,7 @@ class TransformerBlockFast(torch.nn.Module):
         super().__init__()
         self.attention = torch.nn.MultiheadAttention(hidden_size, attn_heads, dropout=dropout, batch_first=True)
         self.attention_dropout = torch.nn.Dropout(dropout)
-        self.attention_norm = LayerNorm(hidden_size)
+        self.attention_norm = torch.nn.LayerNorm(hidden_size)
         
         if acceleration_config.get("pff_block"):
             self.pff = PositionwiseFeedForwardFast(
@@ -721,7 +601,7 @@ class TransformerBlockFast(torch.nn.Module):
         
         
         self.pff_dropout = torch.nn.Dropout(dropout)
-        self.pff_norm = LayerNorm(hidden_size)
+        self.pff_norm = torch.nn.LayerNorm(hidden_size)
 
         self.dropout = torch.nn.Dropout(p=dropout)
 
@@ -746,33 +626,6 @@ class TransformerBlockFast(torch.nn.Module):
 
         return self.dropout(z)
 
-class LayerNorm(torch.nn.Module):
-    """
-    Construct a layernorm module (See citation for details).
-    """
-
-    def __init__(self, features: int, eps: float = 1e-6):
-        """
-        :param features: Number of features.
-        :param eps: A value added to the denominator for numerical stability.
-            Default: ``1e-6``.
-        """
-        super().__init__()
-        self.a_2 = torch.nn.Parameter(torch.ones(features))
-        self.b_2 = torch.nn.Parameter(torch.zeros(features))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        :param x: Input tensor.
-
-        :returns: Normalized input tensor.
-        """
-        mean = x.mean(-1, keepdim=True)
-        std = x.std(-1, keepdim=True)
-        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
-
-
 class PositionwiseFeedForward(torch.nn.Module):
     """
     Implements FFN equation.
@@ -789,7 +642,7 @@ class PositionwiseFeedForward(torch.nn.Module):
         self.w_1 = torch.nn.Linear(d_model, d_ff)
         self.w_2 = torch.nn.Linear(d_ff, d_model)
         self.dropout = torch.nn.Dropout(dropout)
-        self.activation = GELU()
+        self.activation = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -819,11 +672,11 @@ class PositionwiseFeedForwardFast(torch.nn.Module):
         self.dropout = torch.nn.Dropout(dropout)
 
         if acceleration_config["act_fn"] == "gelu":
-            self.activation = GELU()
+            self.activation = nn.GELU()
         elif acceleration_config["act_fn"] == "silu":
             self.activation = torch.nn.SiLU()
         elif acceleration_config["act_fn"] == "gelu_pytorch_tanh":
-            self.activation = PytorchGELUTanh()
+            self.activation = nn.GELU(approximate="tanh")
         elif acceleration_config["act_fn"] == "relu":
             self.activation = torch.nn.ReLU()
 
@@ -834,33 +687,3 @@ class PositionwiseFeedForwardFast(torch.nn.Module):
         :returns: Position wised output.
         """
         return self.w_2(self.dropout(self.activation(self.w_1(x))))
-
-
-class GELU(torch.nn.Module):
-    """
-    Paper Section 3.4, last paragraph notice that BERT used the GELU instead of RELU
-    """
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        :param x: Input tensor.
-
-        :returns: Activated input tensor.
-        """
-        return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
-
-
-class PytorchGELUTanh(torch.nn.Module):
-    """
-    A fast C implementation of the tanh approximation of the GeLU activation function. See
-    https://arxiv.org/abs/1606.08415.
-    
-    It is equivalent to NewGELU and FastGELU but much faster. However, it is not an exact numerical
-    match due to rounding errors.
-    """
-
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.gelu(input, approximate="tanh")
