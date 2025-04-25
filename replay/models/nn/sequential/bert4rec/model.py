@@ -379,7 +379,7 @@ class BaseHead(ABC, torch.nn.Module):
             item_embeddings = item_embeddings[item_ids]
             bias = bias[item_ids]
 
-        logits = item_embeddings.matmul(out_embeddings.unsqueeze(-1)).squeeze(-1) + bias
+        logits = torch.matmul(out_embeddings, item_embeddings.t()) + bias # torch matmul вместо squeeze (squeeze медленный на валидации в lighting в режиме FP16)
         return logits
 
     @abstractmethod
@@ -447,6 +447,22 @@ class ClassificationHead(BaseHead):
         :returns: Bias tensor.
         """
         return self.linear.bias
+    
+    # fused bias в линейном слое
+    def forward(
+        self,
+        out_embeddings: torch.Tensor,
+        item_ids: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        """
+        :param out_embeddings: Embeddings after `forward step`.
+        :param item_ids: Item ids to calculate scores.
+            Default: ``None``.
+
+        :returns: Calculated logits.
+        """
+        logits = torch.nn.functional.linear(out_embeddings, self.linear.weight, self.linear.bias)
+        return logits
 
 
 class TransformerBlock(torch.nn.Module):
@@ -471,11 +487,11 @@ class TransformerBlock(torch.nn.Module):
         super().__init__()
         self.attention = torch.nn.MultiheadAttention(hidden_size, attn_heads, dropout=dropout, batch_first=True)
         self.attention_dropout = torch.nn.Dropout(dropout)
-        self.attention_norm = LayerNorm(hidden_size)
+        self.attention_norm = torch.nn.LayerNorm(hidden_size) # Замена самописного Layer Norm на torch реализацию 
 
         self.pff = PositionwiseFeedForward(d_model=hidden_size, d_ff=feed_forward_hidden, dropout=dropout)
         self.pff_dropout = torch.nn.Dropout(dropout)
-        self.pff_norm = LayerNorm(hidden_size)
+        self.attention_norm = torch.nn.LayerNorm(hidden_size) # Замена самописного Layer Norm на torch реализацию 
 
         self.dropout = torch.nn.Dropout(p=dropout)
 
@@ -500,34 +516,6 @@ class TransformerBlock(torch.nn.Module):
 
         return self.dropout(z)
 
-
-class LayerNorm(torch.nn.Module):
-    """
-    Construct a layernorm module (See citation for details).
-    """
-
-    def __init__(self, features: int, eps: float = 1e-6):
-        """
-        :param features: Number of features.
-        :param eps: A value added to the denominator for numerical stability.
-            Default: ``1e-6``.
-        """
-        super().__init__()
-        self.a_2 = torch.nn.Parameter(torch.ones(features))
-        self.b_2 = torch.nn.Parameter(torch.zeros(features))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        :param x: Input tensor.
-
-        :returns: Normalized input tensor.
-        """
-        mean = x.mean(-1, keepdim=True)
-        std = x.std(-1, keepdim=True)
-        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
-
-
 class PositionwiseFeedForward(torch.nn.Module):
     """
     Implements FFN equation.
@@ -544,7 +532,7 @@ class PositionwiseFeedForward(torch.nn.Module):
         self.w_1 = torch.nn.Linear(d_model, d_ff)
         self.w_2 = torch.nn.Linear(d_ff, d_model)
         self.dropout = torch.nn.Dropout(dropout)
-        self.activation = GELU()
+        self.activation = nn.GELU() # Замена самописной функции активаций на torch реализацию
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -554,16 +542,3 @@ class PositionwiseFeedForward(torch.nn.Module):
         """
         return self.w_2(self.dropout(self.activation(self.w_1(x))))
 
-
-class GELU(torch.nn.Module):
-    """
-    Paper Section 3.4, last paragraph notice that BERT used the GELU instead of RELU
-    """
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        :param x: Input tensor.
-
-        :returns: Activated input tensor.
-        """
-        return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
