@@ -10,6 +10,24 @@ from replay.models.nn.optimizer_utils import FatOptimizerFactory, LRSchedulerFac
 from .dataset import SasRecPredictionBatch, SasRecTrainingBatch, SasRecValidationBatch
 from .model import SasRecModel
 
+import sys
+sys.path.append("./kernels")   
+
+try: 
+    from kernels.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyFunction
+
+except ModuleNotFoundError:
+    print("fused linear cross entropy is not installed. fused_linear_CE loss cannot be used.")
+
+
+try:
+    from kernels.cut_cross_entropy.cce import CCEParams, LinearCrossEntropyFunction
+    from kernels.cut_cross_entropy.utils import (
+        _build_flat_valids,
+        _handle_eps
+    )
+except ModuleNotFoundError:
+    print("cut_cross_entropy is not installed. CCE / CCE_minus loss cannot be used.")
 
 class SasRec(lightning.LightningModule):
     """
@@ -503,6 +521,9 @@ class SasRec(lightning.LightningModule):
 
         if self._loss_type == "CE":
             return torch.nn.CrossEntropyLoss()
+
+        if self._loss_type == "CCE":
+            return LinearCrossEntropyFunction()
 
         msg = "Not supported loss_type"
         raise NotImplementedError(msg)

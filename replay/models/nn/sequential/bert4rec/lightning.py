@@ -14,15 +14,14 @@ import sys
 sys.path.append("./kernels") 
 
 try:
-    from kernels.cut_cross_entropy.cce import CCEParams, LinearCrossEntropyFunction, _build_flat_valids
+    from kernels.cut_cross_entropy.cce import CCEParams, LinearCrossEntropyFunction
     from kernels.cut_cross_entropy.utils import (
         _build_flat_valids,
         _handle_eps,
-        handle_reduction_none,
     )
 except ModuleNotFoundError:
     print("cut_cross_entropy is not installed. CCE / CCE_minus loss cannot be used.")
-Соответствует)
+
 class Bert4Rec(lightning.LightningModule):
     """
     Implements BERT training-validation loop
@@ -520,6 +519,9 @@ class Bert4Rec(lightning.LightningModule):
 
         if self._loss_type == "CE":
             return torch.nn.CrossEntropyLoss()
+
+        if self._loss_type == "CCE":
+            return LinearCrossEntropyFunction()
 
         msg = "Not supported loss_type"
         raise NotImplementedError(msg)
